@@ -2,82 +2,96 @@ import os
 import torch
 import glob
 from torch.utils.data import Dataset
+from tqdm import tqdm  # İlerleme çubuğu için
 
 
-class SlakhTranscriptionDataset(Dataset):
-    def __init__(
-        self, root_dir, split="train", target_class="All", sequence_length=128
-    ):
-        # İşlenmiş .pt dosyalarını bul
-        self.file_paths = sorted(glob.glob(os.path.join(root_dir, "*.pt")))
+class SlakhChunkedDataset(Dataset):
+    def __init__(self, root_dir, split="train", sequence_length=128):
+        self.root_dir = root_dir
         self.sequence_length = sequence_length
         self.hop_length = 512
 
+        # İşlenmiş .pt dosyalarını bul
+        self.file_paths = sorted(glob.glob(os.path.join(root_dir, "*.pt")))
+
+        # --- CHUNKING (Parçalama) HARİTASI ---
+        # Her bir indeksin hangi dosyaya ve hangi başlangıç noktasına
+        # denk geldiğini tutan liste: [(dosya_yolu, baslangic_frame), ...]
+        self.chunks = []
+
+        print(f"📊 Dataset İndeksleniyor ({split})... Lütfen bekleyin.")
+
+        # Dosyaları tek tek açıp ne kadar uzun olduklarına bakmamız lazım
+        # Bu işlem __init__ aşamasında biraz vakit alabilir ama eğitimde hız kazandırır.
+        for path in tqdm(self.file_paths):
+            try:
+                # Sadece shape bilgisini almak için map_location kullanıyoruz
+                # Not: PyTorch tam yükleme yapmadan header okumayı desteklemez,
+                # bu yüzden dosyayı yüklüyoruz.
+                data = torch.load(path, map_location="cpu")
+                total_frames = data["target"].shape[-1]  # Örn: 2000 frame
+
+                # Şarkıyı sequence_length (128) boyutunda dilimlere böl
+                # step = sequence_length (Örtüşmesiz - Non-overlapping)
+                # Eğer örtüşme (overlap) istersen step değerini düşürebilirsin (örn: 64)
+                for start_idx in range(0, total_frames, self.sequence_length):
+                    self.chunks.append((path, start_idx))
+
+            except Exception as e:
+                print(f"⚠️ Dosya okunamadı veya bozuk: {path} - {e}")
+
+        print(
+            f"✅ İndeksleme Tamamlandı: Toplam {len(self.chunks)} parça (chunk) oluşturuldu."
+        )
+
     def __len__(self):
-        return len(self.file_paths)
+        # Artık dosya sayısı değil, toplam parça sayısı döndürüyoruz
+        return len(self.chunks)
 
     def __getitem__(self, idx):
-        path = self.file_paths[idx]
+        # 1. Hangi dosya ve hangi başlangıç noktası olduğunu al
+        path, start_frame = self.chunks[idx]
 
         # Hedeflenen Boyutlar
         req_frames = self.sequence_length
         req_samples = req_frames * self.hop_length
 
         try:
-            # .pt dosyasını yükle
+            # 2. Dosyayı yükle
             data = torch.load(path)
-            waveform = data["waveform"].float()
-            target = data["target"].float()
+            waveform = data["waveform"].float()  # [1, Total_Samples]
+            target = data["target"].float()  # [1, 88, Total_Frames]
 
-            # --- KORUMA 1: BOŞ DOSYA KONTROLÜ ---
-            # Eğer dosya boşsa [1, 0] ise hemen "Sessizlik" döndür
-            if waveform.shape[-1] == 0 or target.shape[-1] == 0:
-                return torch.zeros(1, req_samples), torch.zeros(1, 88, req_frames)
+            # 3. Kesme (Slicing) Koordinatlarını Hesapla
+            end_frame = start_frame + req_frames
 
-            curr_frames = target.shape[2]
+            start_sample = start_frame * self.hop_length
+            end_sample = end_frame * self.hop_length
 
-            # --- DURUM A: Veri Uzunsa (KIRP) ---
-            if curr_frames > req_frames:
-                max_frame_start = curr_frames - req_frames
-                # Rastgele bir başlangıç noktası seç
-                start_frame = torch.randint(0, max_frame_start, (1,)).item()
-                start_sample = start_frame * self.hop_length
+            # 4. Veriyi Kes
+            # Not: Eğer end_frame, şarkının sonundan büyükse PyTorch hata vermez,
+            # sadece alabildiği kadarını alır (kısa gelir).
+            chunk_target = target[:, :, start_frame:end_frame]
+            chunk_waveform = waveform[:, start_sample:end_sample]
 
-                target = target[:, :, start_frame : start_frame + req_frames]
-                waveform = waveform[:, start_sample : start_sample + req_samples]
+            # 5. Boyut Kontrolü ve Padding (Doldurma)
+            # Eğer şarkının son parçasıysa (kısa geldiyse), sonunu 0 ile doldur.
+            current_frames = chunk_target.shape[2]
+            current_samples = chunk_waveform.shape[1]
 
-            # --- DURUM B: Veri Kısaysa (DOLDUR/PAD) ---
-            else:
-                pad_frames = req_frames - curr_frames
-                # Dikkat: Sample padding hesabı hassas yapılmalı
-                pad_samples = req_samples - waveform.shape[1]
+            if current_frames < req_frames:
+                pad_amount = req_frames - current_frames
+                chunk_target = torch.nn.functional.pad(chunk_target, (0, pad_amount))
 
-                if pad_frames > 0:
-                    target = torch.nn.functional.pad(target, (0, pad_frames))
-                if pad_samples > 0:
-                    waveform = torch.nn.functional.pad(waveform, (0, pad_samples))
+            if current_samples < req_samples:
+                pad_amount = req_samples - current_samples
+                chunk_waveform = torch.nn.functional.pad(
+                    chunk_waveform, (0, pad_amount)
+                )
 
-            # --- KORUMA 2: SON BOYUT KONTROLÜ ---
-            # Hesaplama hatalarına karşı son bir zorlama yapıyoruz
-            # Waveform [1, 65536] olmak ZORUNDA
-            if waveform.shape[1] != req_samples:
-                if waveform.shape[1] > req_samples:
-                    waveform = waveform[:, :req_samples]
-                else:
-                    diff = req_samples - waveform.shape[1]
-                    waveform = torch.nn.functional.pad(waveform, (0, diff))
-
-            # Target [1, 88, 128] olmak ZORUNDA
-            if target.shape[2] != req_frames:
-                if target.shape[2] > req_frames:
-                    target = target[:, :, :req_frames]
-                else:
-                    diff = req_frames - target.shape[2]
-                    target = torch.nn.functional.pad(target, (0, diff))
-
-            return waveform, target
+            return chunk_waveform, chunk_target
 
         except Exception as e:
-            print(f"⚠️ Hatalı dosya atlandı: {path} - Hata: {e}")
-            # Hata durumunda eğitim durmasın diye boş veri döndür
+            print(f"⚠️ Chunk yükleme hatası: {path} (Idx: {start_frame}) - {e}")
+            # Hata durumunda boş tensor döndür
             return torch.zeros(1, req_samples), torch.zeros(1, 88, req_frames)
