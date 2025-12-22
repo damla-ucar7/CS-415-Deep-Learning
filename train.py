@@ -27,7 +27,7 @@ CONFIG = {
     "save_path": "model_piano.pth",
     "target_class": "Piano",
     "sequence_length": 128,
-    "batch_size": 64,
+    "batch_size": 32,
     "learning_rate": 0.0003,
     "pos_weight": 5.0,
     "epochs": 20,
