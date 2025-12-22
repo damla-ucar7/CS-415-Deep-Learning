@@ -27,10 +27,10 @@ CONFIG = {
     "save_path": "model_piano.pth",
     "target_class": "Piano",
     "sequence_length": 128,
-    "batch_size": 32,
+    "batch_size": 64,
     "learning_rate": 0.0003,
     "pos_weight": 5.0,
-    "epochs": 100,
+    "epochs": 20,
     "threshold": 0.3,
     "num_workers": 4,
     "sample_rate": 16000,
@@ -159,19 +159,27 @@ def preprocess_dataset():
 # 4. TRAINING LOOP WITH VALIDATION
 # ==========================================
 def train_model():
-    print(f"🚀 Veri Seti Yükleniyor...")
+    all_files = sorted(glob.glob(os.path.join(CONFIG["root_dir"], "*.pt")))
 
-    full_dataset = SlakhChunkedDataset(
-        root_dir=CONFIG["root_dir"], sequence_length=CONFIG["sequence_length"]
+    # 2. Split FILES, not chunks
+    import random
+
+    random.shuffle(all_files)
+
+    # 3. Dosya listesini böl (Split Files)
+    train_split_idx = int(0.8 * len(all_files))
+    train_files = all_files[:train_split_idx]
+    val_files = all_files[train_split_idx:]
+    # 3. Modify Dataset Class to accept file_list (You need to update dataset.py __init__)
+    train_dataset = SlakhChunkedDataset(
+        root_dir=CONFIG["root_dir"],
+        file_list=train_files,  # <--- Pass specific files
+        sequence_length=CONFIG["sequence_length"],
     )
-
-    # --- TRAIN / VALIDATION SPLIT (%80 - %20) ---
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-
-    print(
-        f"📊 Veri Bölümü: {len(full_dataset)} Toplam -> {train_size} Train | {val_size} Validation"
+    val_dataset = SlakhChunkedDataset(
+        root_dir=CONFIG["root_dir"],
+        file_list=val_files,  # <--- Pass specific files
+        sequence_length=CONFIG["sequence_length"],
     )
 
     train_loader = DataLoader(
@@ -210,7 +218,7 @@ def train_model():
     )
 
     history = {"train_loss": [], "val_loss": [], "train_f1": [], "val_f1": []}
-    best_val_loss = float("inf")
+    best_val_f1 = float("-inf")
 
     print("🔥 Eğitim Başlıyor...")
 
@@ -308,11 +316,11 @@ def train_model():
 
         scheduler.step(avg_val_loss)
 
-        if avg_val_loss < best_val_loss:
+        if avg_val_f1 > best_val_f1:
             print(
-                f"   ⭐ New Best Model! Saving... ({best_val_loss:.4f} -> {avg_val_loss:.4f})"
+                f"   ⭐ New Best Model! Saving... ({best_val_f1:.4f} -> {avg_val_f1:.4f})"
             )
-            best_val_loss = avg_val_loss
+            best_val_f1 = avg_val_f1
             torch.save(model.state_dict(), CONFIG["save_path"])
         print("-" * 50)
 
